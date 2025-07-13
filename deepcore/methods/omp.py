@@ -3,8 +3,8 @@ import torch
 from torch.utils.data import DataLoader
 from .methods_utils import FacilityLocation, submodular_optimizer, OrthogonalMP_REG, OrthogonalMP_REG_Parallel
 import numpy as np
-from .methods_utils.euclidean import euclidean_dist_pair_np
-import methods_utils.euclidean as eu_module
+from .methods_utils.euclidean import euclidean_dist_pair_np, euclidean_dist_np
+# import methods_utils.euclidean as eu_module
 from ..nets.nets_utils import MyDataParallel
 
 class OMP(EarlyTrain):
@@ -79,16 +79,26 @@ class OMP(EarlyTrain):
         self.model.train()
         return euclidean_dist_pair_np(gradients)
 
-    # def calc_gradient_vectors(self):
-    #     orig = eu_module.euclidean_dist_pair_np
-    #     # patch to identity over first argument
-    #     eu_module.euclidean_dist_pair_np = lambda *args, **kwargs: args[0]
-    #     try:
-    #         # explicitly call Craig's implementation
-    #         return calc_gradient(self, index)
-    #     finally:
-    #         eu_module.euclidean_dist_pair_np = orig
+    def construct_matrix(self, index=None):
+        self.model.eval()
+        self.model.no_grad = True
+        with torch.no_grad():
+            with self.model.embedding_recorder:
+                sample_num = self.n_train if index is None else len(index)
+                matrix = torch.zeros([sample_num, self.emb_dim], requires_grad=False).to(self.args.device)
 
+                data_loader = torch.utils.data.DataLoader(self.dst_train if index is None else
+                                            torch.utils.data.Subset(self.dst_train, index),
+                                            batch_size=self.args.selection_batch,
+                                            num_workers=self.args.workers)
+
+                for i, (inputs, _) in enumerate(data_loader):
+                    self.model(inputs.to(self.args.device))
+                    matrix[i * self.args.selection_batch:min((i + 1) * self.args.selection_batch, sample_num)] = self.model.embedding_recorder.embedding
+
+        self.model.no_grad = False
+        return matrix
+    
     def calc_weights(self, matrix, result):
         min_sample = np.argmax(matrix[result], axis=0)
         weights = np.ones(np.sum(result) if result.dtype == bool else len(result))
@@ -101,27 +111,36 @@ class OMP(EarlyTrain):
             self.model = self.model.module
 
         # Build A and b using original calc_gradient
-        A = self.calc_gradient()
-        b = A.sum(axis=0)
+        A = self.construct_matrix()
+        b = A.sum(dim=0) 
         nnz = int(self.fraction * A.shape[0])
 
         # Run OMP based on device
         if self.args.device == 'cuda':
-            A_t = torch.from_numpy(A).to('cuda')
-            b_t = torch.from_numpy(b).to('cuda')
-            x_t = OrthogonalMP_REG_Parallel(A_t, b_t, tol=1e-4,
+            x_t = OrthogonalMP_REG_Parallel(A, b, tol=1e-4,
                                             nnz=nnz, positive=False,
                                             lam=self.lam, device='cuda')
             x = x_t.cpu().numpy()
         else:
-            x = OrthogonalMP_REG(A, b, tol=1e-4,
+            A_np = A.cpu().numpy()
+            b_np = b.cpu().numpy()
+            x = OrthogonalMP_REG(A_np, b_np, tol=1e-4,
                                  nnz=nnz, positive=False,
                                  lam=self.lam)
 
-        selected = np.nonzero(x)[0]
-        weights = x[selected]
-        return {"indices": selected.astype(np.int32), "weights": weights}
-    
+        indices = np.nonzero(x)[0].astype(np.int32)
+        mask = np.zeros_like(x, dtype=bool)
+        mask[indices] = True
+
+        if self.use_embedding:
+            matrix = -1.0 * euclidean_dist_np(A_np[indices], A_np[indices])
+        else:
+            matrix = -1.0 * self.calc_gradient(indices)
+            matrix -= np.min(matrix) - 1e-3
+
+        weights = self.calc_weights(matrix, mask)
+        return {"indices": indices, "weights": weights}
+
     def select(self, **kwargs):
         selection_result = self.run()
         return selection_result
