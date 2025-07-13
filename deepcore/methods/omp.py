@@ -109,37 +109,40 @@ class OMP(EarlyTrain):
     def finish_run(self):
         if isinstance(self.model, MyDataParallel):
             self.model = self.model.module
+        self.model.no_grad = True
+        with self.model.embedding_recorder:
+            # chọn nguồn dữ liệu để xây A
+            if self.use_embedding:
+                self.emb_dim = self.model.embedding_recorder.embedding.shape[1]
+                A = self.construct_matrix()
+            else:
+                A = torch.from_numpy(self.calc_gradient_vectors()).to(self.args.device)
+            b = A.sum(dim=0)
+            nnz = int(self.fraction * A.shape[0])
 
-        # Build A and b using original calc_gradient
-        A = self.construct_matrix()
-        b = A.sum(dim=0) 
-        nnz = int(self.fraction * A.shape[0])
+            if self.args.device == 'cuda':
+                x_t = OrthogonalMP_REG_Parallel(A, b, tol=1e-4, nnz=nnz,
+                                                positive=False, lam=self.lam, device='cuda')
+                x = x_t.cpu().numpy()
+            else:
+                A_np = A.cpu().numpy()
+                b_np = b.cpu().numpy()
+                x = OrthogonalMP_REG(A_np, b_np, tol=1e-4, nnz=nnz, positive=False, lam=self.lam)
 
-        # Run OMP based on device
-        if self.args.device == 'cuda':
-            x_t = OrthogonalMP_REG_Parallel(A, b, tol=1e-4,
-                                            nnz=nnz, positive=False,
-                                            lam=self.lam, device='cuda')
-            x = x_t.cpu().numpy()
-        else:
-            A_np = A.cpu().numpy()
-            b_np = b.cpu().numpy()
-            x = OrthogonalMP_REG(A_np, b_np, tol=1e-4,
-                                 nnz=nnz, positive=False,
-                                 lam=self.lam)
+            indices = np.nonzero(x)[0].astype(np.int32)
+            mask = np.zeros_like(x, dtype=bool)
+            mask[indices] = True
 
-        indices = np.nonzero(x)[0].astype(np.int32)
-        mask = np.zeros_like(x, dtype=bool)
-        mask[indices] = True
+            if self.use_embedding:
+                matrix = -1.0 * euclidean_dist_np(A_np[indices], A_np[indices])
+            else:
+                matrix = -1.0 * self.calc_gradient(indices)
+                matrix -= np.min(matrix) - 1e-3
 
-        if self.use_embedding:
-            matrix = -1.0 * euclidean_dist_np(A_np[indices], A_np[indices])
-        else:
-            matrix = -1.0 * self.calc_gradient(indices)
-            matrix -= np.min(matrix) - 1e-3
-
-        weights = self.calc_weights(matrix, mask)
+            weights = self.calc_weights(matrix, mask)
+        self.model.no_grad = False
         return {"indices": indices, "weights": weights}
+
 
     def select(self, **kwargs):
         selection_result = self.run()
