@@ -1,4 +1,5 @@
 from .earlytrain import EarlyTrain
+from .coresetmethod import CoresetMethod
 import torch
 from torch.utils.data import DataLoader
 from .methods_utils import FacilityLocation, submodular_optimizer, OrthogonalMP_REG, OrthogonalMP_REG_Parallel
@@ -7,16 +8,16 @@ from .methods_utils.euclidean import euclidean_dist_pair_np, euclidean_dist_np
 # import methods_utils.euclidean as eu_module
 from ..nets.nets_utils import MyDataParallel
 
-class OMP(EarlyTrain):
+class OMP(CoresetMethod):
     """
     Selector using Orthogonal Matching Pursuit (regularized) on gradient vectors.
     A: gradient matrix of shape (n_samples, feature_dim)
     b: sum of gradient vectors across samples.
     Supports both CPU and CUDA via OrthogonalMP_REG(_Parallel).
     """
-    def __init__(self, dst_train, args, lam=0.1, fraction=0.5, random_seed=None, epochs=200, specific_model=None,
+    def __init__(self, dst_train, args, lam=0.1, fraction=0.5, random_seed=None,
                  balance=True, greedy="LazyGreedy", **kwargs):
-        super().__init__(dst_train, args, fraction, random_seed, epochs, specific_model, **kwargs)
+        super().__init__(dst_train, args, fraction, random_seed, **kwargs)
 
         if greedy not in submodular_optimizer.optimizer_choices:
             raise ModuleNotFoundError("Greedy optimizer not found.")
@@ -39,13 +40,13 @@ class OMP(EarlyTrain):
     def before_run(self):
         pass
 
-    def num_classes_mismatch(self):
-        raise ValueError("num_classes of pretrain dataset does not match that of the training dataset.")
+    # def num_classes_mismatch(self):
+    #     raise ValueError("num_classes of pretrain dataset does not match that of the training dataset.")
 
-    def while_update(self, outputs, loss, targets, epoch, batch_idx, batch_size):
-        if batch_idx % self.args.print_freq == 0:
-            print('| Epoch [%3d/%3d] Iter[%3d/%3d]\t\tLoss: %.4f' % (
-                epoch, self.epochs, batch_idx + 1, (self.n_pretrain_size // batch_size) + 1, loss.item()))
+    # def while_update(self, outputs, loss, targets, epoch, batch_idx, batch_size):
+    #     if batch_idx % self.args.print_freq == 0:
+    #         print('| Epoch [%3d/%3d] Iter[%3d/%3d]\t\tLoss: %.4f' % (
+    #             epoch, self.epochs, batch_idx + 1, (self.n_pretrain_size // batch_size) + 1, loss.item()))
 
     def calc_gradient(self, index=None):
         self.model.eval()
@@ -106,7 +107,7 @@ class OMP(EarlyTrain):
             weights[i] = weights[i] + 1
         return weights
 
-    def finish_run(self):
+    def run(self):
         if isinstance(self.model, MyDataParallel):
             self.model = self.model.module
         self.model.no_grad = True
@@ -133,11 +134,7 @@ class OMP(EarlyTrain):
             mask = np.zeros_like(x, dtype=bool)
             mask[indices] = True
 
-            if self.use_embedding:
-                matrix = -1.0 * euclidean_dist_np(A_np[indices], A_np[indices])
-            else:
-                matrix = -1.0 * self.calc_gradient(indices)
-                matrix -= np.min(matrix) - 1e-3
+            matrix = -1.0 * euclidean_dist_np(A_np[indices], A_np[indices])
 
             weights = self.calc_weights(matrix, mask)
         self.model.no_grad = False
